@@ -39,17 +39,34 @@ def _read_int(path: Path) -> Optional[int]:
 
 
 def _find_rapl_package(root: Path = RAPL_ROOT) -> Optional[Path]:
+    """
+    Primer dominio RAPL de tipo `package-*`.
+
+    En kernels modernos coexisten dos "control types":
+      - intel-rapl       (MSR)
+      - intel-rapl-mmio  (MMIO)
+    Reportan la misma medición. Preferimos el MSR: suele tener permisos
+    más laxos y MMIO es opcional. Si solo está disponible MMIO, lo usamos.
+    """
     if not root.is_dir():
         return None
+
+    msr: list[Path] = []
+    mmio: list[Path] = []
     for entry in sorted(root.iterdir()):
         try:
             name = (entry / "name").read_text().strip()
         except OSError:
             continue
-        if name.startswith("package"):
-            return entry
-    return None
+        if not name.startswith("package"):
+            continue
+        (mmio if "mmio" in entry.name else msr).append(entry)
 
+    if msr:
+        return msr[0]
+    if mmio:
+        return mmio[0]
+    return None
 
 def _find_cpu_hwmon_temp(root: Path = HWMON_ROOT) -> Optional[Path]:
     if not root.is_dir():
@@ -75,6 +92,25 @@ def _find_cpu_hwmon_temp(root: Path = HWMON_ROOT) -> Optional[Path]:
         return candidates[0]
     return None
 
+def _find_fan_input(root: Path = HWMON_ROOT) -> Optional[Path]:
+    """Primer `fan*_input` en hwmon. Prefiere etiquetas 'CPU'/'Processor'."""
+    if not root.is_dir():
+        return None
+    candidates: list[Path] = []
+    for entry in sorted(root.iterdir()):
+        candidates.extend(sorted(entry.glob("fan*_input")))
+    if not candidates:
+        return None
+    for fan in candidates:
+        label_file = fan.with_name(fan.name.replace("_input", "_label"))
+        try:
+            label = label_file.read_text().strip().lower()
+        except OSError:
+            label = ""
+        if "cpu" in label or "processor" in label:
+            return fan
+    return candidates[0]
+
 
 class LinuxSensorBackend(SensorBackend):
     """RAPL (energía) + hwmon (temperatura) en sistemas Linux."""
@@ -86,6 +122,7 @@ class LinuxSensorBackend(SensorBackend):
         self._energy_file: Optional[Path] = None
         self._max_energy_uj: Optional[int] = None
         self._temp_file: Optional[Path] = None
+        self._fan_file: Optional[Path] = None
 
         self._last_uj: Optional[int] = None
         self._last_ts: Optional[float] = None
@@ -108,6 +145,7 @@ class LinuxSensorBackend(SensorBackend):
                 self._last_ts = time.monotonic()
 
         self._temp_file = _find_cpu_hwmon_temp()
+        self._fan_file = _find_fan_input()
         self._cumulative_J = 0.0
 
     def stop(self) -> None:
@@ -117,6 +155,7 @@ class LinuxSensorBackend(SensorBackend):
     def read(self) -> SensorReading:
         now = time.monotonic()
         temp = self._read_temp()
+        fan = self._read_fan()
         power, delta_J = self._read_power_and_delta(now)
         if delta_J > 0:
             self._cumulative_J += delta_J
@@ -126,6 +165,8 @@ class LinuxSensorBackend(SensorBackend):
             sources.append("rapl")
         if self._temp_file is not None:
             sources.append("hwmon")
+        if self._fan_file is not None and "hwmon" not in sources:
+            sources.append("hwmon")
         src = "+".join(sources) if sources else "linux_empty"
 
         return SensorReading(
@@ -133,7 +174,7 @@ class LinuxSensorBackend(SensorBackend):
             cpu_temp_C=temp,
             power_W=power,
             energy_J=self._cumulative_J,
-            fan_rpm=None,
+            fan_rpm=fan,
             is_real=bool(sources),
             source=src,
         )
@@ -143,6 +184,12 @@ class LinuxSensorBackend(SensorBackend):
             return None
         milliC = _read_int(self._temp_file)
         return None if milliC is None else milliC / 1000.0
+    
+    def _read_fan(self) -> Optional[float]:
+        if self._fan_file is None:
+            return None
+        rpm = _read_int(self._fan_file)
+        return None if rpm is None else float(rpm)
 
     def _read_power_and_delta(self, now: float) -> tuple[Optional[float], float]:
         if self._energy_file is None or self._last_uj is None or self._last_ts is None:

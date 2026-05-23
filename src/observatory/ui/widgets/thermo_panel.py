@@ -47,4 +47,13 @@ class ThermoPanel(Panel):
         self.e_landauer_value.setText(f"{balance.energy_landauer_J:.3e}")
         self.ratio_value.setText(f"{balance.inefficiency_factor:.2e}")
         self.temp_value.setText(f"{balance.temperature_K:.1f}")
-        self.msg.setText(balance.qualitative_message())
+
+        if balance.bits_processed <= 0:
+            self.msg.setText("Esperando paquetes para empezar el balance.")
+        elif balance.energy_real_J <= 0:
+            self.msg.setText(
+                "Sin energía medida. En Linux habilita RAPL con: "
+                "sudo chmod a+r /sys/class/powercap/intel-rapl:*/energy_uj"
+            )
+        else:
+            self.msg.setText(balance.qualitative_message())
