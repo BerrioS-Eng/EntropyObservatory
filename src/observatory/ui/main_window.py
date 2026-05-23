@@ -1,25 +1,23 @@
 """
 Ventana principal. Cablea:
-  - RollingEntropyEstimator + CaptureWorker (LIVE/REPLAY/SIMULADO)
+  - RollingEntropyEstimator + CaptureWorker (LIVE/SIMULADO)
   - SensorBackend (real o mock)
-  - 4 paneles en layout 2×2
-  - QTimer central a 2 Hz que llama snapshot() + sensor.read() y
-    propaga al UI.
+  - 4 paneles en layout 2*2
+  - QTimer central a 2 Hz
 
-Hilos:
-  - El estimator es thread-safe; el worker corre en su propio QThread.
-  - El sensor backend se lee desde el hilo Qt (read() es <5 ms).
+Comportamiento UX:
+  - El combo "Modo" es el estado: cambiarlo reinicia la captura.
+  - Al abrir, se inicia automáticamente en el modo por defecto.
+  - Si LIVE falla por permisos, cae a SIMULADO y se notifica.
 """
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QAction
+from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import (
-    QComboBox, QFileDialog, QGridLayout, QLabel, QMainWindow, QMessageBox,
+    QComboBox, QGridLayout, QLabel, QMainWindow, QMessageBox,
     QPushButton, QStatusBar, QToolBar, QWidget,
 )
 
@@ -28,25 +26,21 @@ from observatory.physics import compute_balance
 from observatory.sensors import MockSensorBackend, SensorBackend, detect
 from observatory.workers import (
     CaptureMode, CaptureWorker,
-    LiveCaptureWorker, ReplayCaptureWorker, SimulatedCaptureWorker,
+    LiveCaptureWorker, SimulatedCaptureWorker,
 )
 
-from .theme import Palette, apply_pyqtgraph_defaults
 from .widgets import EntropyPanel, SensorPanel, ThermoPanel, TrafficPanel
 
 
 _TICK_MS = 500
-# pkts/s que consideramos "100% de carga" para el sensor mock
-_RATE_SATURATION = 1000.0
+_RATE_SATURATION = 1000.0   # pkts/s que consideramos "100%" para el sensor mock
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, default_pcap: Optional[Path] = None):
+    def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Entropy Observatory")
         self.resize(1400, 880)
-
-        self._default_pcap = default_pcap
 
         self.estimator = RollingEntropyEstimator(window_seconds=10.0)
         self.worker: Optional[CaptureWorker] = None
@@ -62,6 +56,9 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self._on_tick)
         self.timer.start()
 
+        # Auto-start en el modo seleccionado por defecto
+        self._start_capture()
+
     # ─────────────────────────  layout  ─────────────────────────
     def _build_toolbar(self) -> None:
         tb = QToolBar("Controles")
@@ -70,22 +67,22 @@ class MainWindow(QMainWindow):
 
         tb.addWidget(QLabel("Modo:"))
         self.mode_combo = QComboBox()
-        self.mode_combo.addItem("Simulado", CaptureMode.SIMULATED)
-        self.mode_combo.addItem("Replay",   CaptureMode.REPLAY)
         self.mode_combo.addItem("En vivo",  CaptureMode.LIVE)
+        self.mode_combo.addItem("Simulado", CaptureMode.SIMULATED)
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         tb.addWidget(self.mode_combo)
 
         tb.addSeparator()
 
         self.start_btn = QPushButton("● Capturar")
         self.start_btn.setProperty("role", "primary")
-        self.start_btn.clicked.connect(self._on_start_clicked)
+        self.start_btn.clicked.connect(self._start_capture)
         tb.addWidget(self.start_btn)
 
         self.stop_btn = QPushButton("⏹ Detener")
         self.stop_btn.setProperty("role", "danger")
         self.stop_btn.setEnabled(False)
-        self.stop_btn.clicked.connect(self._on_stop_clicked)
+        self.stop_btn.clicked.connect(self._stop_capture)
         tb.addWidget(self.stop_btn)
 
         tb.addSeparator()
@@ -142,50 +139,37 @@ class MainWindow(QMainWindow):
         return ""
 
     # ─────────────────────────  capture lifecycle  ─────────────────────────
-    def _on_start_clicked(self) -> None:
+    def _build_worker(self, mode: CaptureMode) -> CaptureWorker:
+        if mode == CaptureMode.LIVE:
+            return LiveCaptureWorker(self.estimator)
+        if mode == CaptureMode.SIMULATED:
+            return SimulatedCaptureWorker(self.estimator, scenario="navegacion")
+        raise RuntimeError(f"Modo no soportado: {mode}")
+
+    def _start_capture(self) -> None:
+        if self.worker is not None:
+            return
         mode: CaptureMode = self.mode_combo.currentData()
-        try:
-            worker = self._build_worker(mode)
-        except RuntimeError as e:
-            QMessageBox.warning(self, "No se pudo iniciar", str(e))
-            return
-        if worker is None:
-            return
+        worker = self._build_worker(mode)
 
         self.estimator.reset()
         self.entropy_panel.reset()
         self.sensor_panel.reset()
 
         worker.error.connect(self._on_capture_error)
-        worker.started_capture.connect(lambda: self.status_msg.setText(f"Captura activa ({mode.value})."))
-        worker.stopped_capture.connect(lambda: self.status_msg.setText("Captura detenida."))
+        worker.started_capture.connect(
+            lambda m=mode: self.status_msg.setText(f"Captura activa ({m.value}).")
+        )
+        worker.stopped_capture.connect(
+            lambda: self.status_msg.setText("Captura detenida.")
+        )
 
         self.worker = worker
         worker.start()
-
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        self.mode_combo.setEnabled(False)
 
-    def _build_worker(self, mode: CaptureMode) -> Optional[CaptureWorker]:
-        if mode == CaptureMode.SIMULATED:
-            return SimulatedCaptureWorker(self.estimator, scenario="navegacion")
-        if mode == CaptureMode.LIVE:
-            return LiveCaptureWorker(self.estimator)
-        if mode == CaptureMode.REPLAY:
-            pcap = self._default_pcap
-            if pcap is None:
-                path, _ = QFileDialog.getOpenFileName(
-                    self, "Selecciona un archivo .pcap/.pcapng",
-                    filter="PCAP (*.pcap *.pcapng);;Todos (*)",
-                )
-                if not path:
-                    return None
-                pcap = Path(path)
-            return ReplayCaptureWorker(self.estimator, pcap_path=pcap, speed=1.0)
-        raise RuntimeError(f"Modo no soportado: {mode}")
-
-    def _on_stop_clicked(self) -> None:
+    def _stop_capture(self) -> None:
         if self.worker is None:
             return
         self.worker.stop_capture()
@@ -193,11 +177,26 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        self.mode_combo.setEnabled(True)
+
+    def _on_mode_changed(self) -> None:
+        """Cambiar el modo = reiniciar la captura en el nuevo modo."""
+        if self.worker is not None:
+            self._stop_capture()
+            self._start_capture()
 
     def _on_capture_error(self, msg: str) -> None:
+        was_live = self.mode_combo.currentData() == CaptureMode.LIVE
         QMessageBox.critical(self, "Error de captura", msg)
-        self._on_stop_clicked()
+        self._stop_capture()
+        if was_live:
+            # Fallback a Simulado para que la GUI no quede muda
+            idx = self.mode_combo.findData(CaptureMode.SIMULATED)
+            if idx >= 0:
+                self.mode_combo.blockSignals(True)
+                self.mode_combo.setCurrentIndex(idx)
+                self.mode_combo.blockSignals(False)
+            self.status_msg.setText("LIVE no disponible — usando Simulado.")
+            self._start_capture()
 
     def _on_sensor_changed(self) -> None:
         kind = self.sensor_combo.currentData()
@@ -213,14 +212,11 @@ class MainWindow(QMainWindow):
     def _on_tick(self) -> None:
         snap = self.estimator.snapshot()
 
-        # Si el sensor es mock, alimentarle la carga real de paquetes
         if isinstance(self.sensor, MockSensorBackend):
             self.sensor.set_load(min(1.0, snap.pkt_rate / _RATE_SATURATION))
 
         reading = self.sensor.read()
 
-        # Bits procesados = total_bytes * 8 (proxy crudo);
-        # T de referencia = temperatura medida o 300 K.
         bits = snap.total_bytes * 8.0
         T = reading.cpu_temp_C + 273.15 if reading.cpu_temp_C is not None else 300.0
         balance = compute_balance(
@@ -236,9 +232,7 @@ class MainWindow(QMainWindow):
 
     # ─────────────────────────  shutdown  ─────────────────────────
     def closeEvent(self, event) -> None:  # noqa: N802
-        if self.worker is not None:
-            self.worker.stop_capture()
-            self.worker.wait(3000)
+        self._stop_capture()
         try:
             self.sensor.stop()
         except Exception:

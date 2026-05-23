@@ -1,14 +1,10 @@
 """
 Worker de captura de tráfico.
 
-Ofrece tres modos:
+Ofrece dos modos:
 
   LIVE       — captura en vivo con scapy.AsyncSniffer. Requiere root o
                CAP_NET_RAW en Linux, admin en Windows, root en macOS.
-
-  REPLAY     — reproduce un archivo .pcapng respetando los timestamps
-               originales. Útil para desarrollo, pruebas reproducibles
-               y demos en sustentación sin tocar la red.
 
   SIMULATED  — genera estadísticas sintéticas según el escenario
                seleccionado. No requiere permisos. Para iterar la UI.
@@ -19,8 +15,9 @@ Diseño:
     compartido (thread-safe).
   - La GUI consulta el estimator vía snapshot() en su propio timer.
   - El worker emite señales solo para eventos discretos:
-      started, stopped, error(str), packet_observed(int)
+      started, stopped, error(str), progress(int, int)
 """
+
 from __future__ import annotations
 
 import os
@@ -36,7 +33,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 # scapy se importa perezosamente para que el módulo cargue aunque
 # el usuario no tenga scapy instalado (modo SIMULATED debe funcionar).
 try:
-    from scapy.all import AsyncSniffer, PcapReader, IP, IPv6, TCP, UDP, ICMP, Raw
+    from scapy.all import AsyncSniffer, IP, IPv6, TCP, UDP, ICMP, Raw
     SCAPY_AVAILABLE = True
 except ImportError:
     SCAPY_AVAILABLE = False
@@ -46,7 +43,6 @@ from observatory.entropy import RollingEntropyEstimator
 
 class CaptureMode(Enum):
     LIVE = "live"
-    REPLAY = "replay"
     SIMULATED = "simulated"
 
 
@@ -121,8 +117,6 @@ class CaptureWorker(QThread):
         """Factory por modo."""
         if mode == CaptureMode.LIVE:
             return LiveCaptureWorker(estimator, **kwargs)
-        if mode == CaptureMode.REPLAY:
-            return ReplayCaptureWorker(estimator, **kwargs)
         if mode == CaptureMode.SIMULATED:
             return SimulatedCaptureWorker(estimator, **kwargs)
         raise ValueError(f"Modo desconocido: {mode}")
@@ -203,87 +197,6 @@ class LiveCaptureWorker(CaptureWorker):
         except Exception:
             # Nunca dejar que un paquete malformado mate al sniffer
             pass
-
-
-# ─────────────────────────  Replay  ─────────────────────────
-class ReplayCaptureWorker(CaptureWorker):
-    """
-    Reproduce un .pcapng respetando timestamps relativos.
-
-    `speed`:
-        1.0  — tiempo real
-        >1.0 — más rápido (5.0 = 5×, 60.0 = 1 minuto/segundo)
-        0.0  — tan rápido como pueda (sin sleep)
-    `loop`: vuelve a empezar al terminar.
-    """
-
-    def __init__(
-        self,
-        estimator: RollingEntropyEstimator,
-        pcap_path: str | Path,
-        speed: float = 1.0,
-        loop: bool = False,
-    ):
-        super().__init__(estimator)
-        self.pcap_path = Path(pcap_path)
-        self.speed = max(0.0, speed)
-        self.loop = loop
-
-    def run(self) -> None:
-        if not SCAPY_AVAILABLE:
-            self.error.emit("scapy no está instalado.")
-            return
-        if not self.pcap_path.exists():
-            self.error.emit(f"Archivo no encontrado: {self.pcap_path}")
-            return
-
-        try:
-            self.started_capture.emit()
-            while not self._stop_flag.is_set():
-                self._replay_once()
-                if not self.loop:
-                    break
-                self.estimator.reset()
-            self.stopped_capture.emit()
-        except Exception as e:
-            self.error.emit(f"Error de replay: {type(e).__name__}: {e}")
-
-    def _replay_once(self) -> None:
-        first_pcap_ts: Optional[float] = None
-        replay_start = time.time()
-
-        with PcapReader(str(self.pcap_path)) as pr:
-            for pkt in pr:
-                if self._stop_flag.is_set():
-                    return
-                pcap_ts = float(pkt.time)
-                if first_pcap_ts is None:
-                    first_pcap_ts = pcap_ts
-
-                # Calcular cuánto esperar para mantener timing original
-                if self.speed > 0:
-                    target_elapsed = (pcap_ts - first_pcap_ts) / self.speed
-                    actual_elapsed = time.time() - replay_start
-                    sleep_for = target_elapsed - actual_elapsed
-                    if sleep_for > 0:
-                        # interruptible sleep
-                        if self._stop_flag.wait(sleep_for):
-                            return
-
-                try:
-                    size, proto, src_ip, dst_port, payload = extract_packet_fields(pkt)
-                    self.estimator.observe(
-                        ts=time.time(),
-                        size=size, proto=proto,
-                        src_ip=src_ip, dst_port=dst_port,
-                        payload=payload,
-                    )
-                    self._pkts_seen += 1
-                    if self._pkts_seen % 200 == 0:
-                        self.progress.emit(self._pkts_seen, -1)
-                except Exception:
-                    pass
-
 
 # ─────────────────────────  Simulated  ─────────────────────────
 class SimulatedCaptureWorker(CaptureWorker):
