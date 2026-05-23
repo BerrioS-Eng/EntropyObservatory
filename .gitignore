@@ -1,3 +1,5 @@
 # Local virtual environments
 venv/
 .venv/
+# Cache
+__pycache__
