@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "entropy-observatory"
+version = "0.2.0"
+description = "Dashboard en vivo para correlación entre entropía de tráfico de red y disipación térmica del hardware."
+authors = [{name = "Sebastian Andres Berrio Murillo"}]
+requires-python = ">=3.10"
+dependencies = [
+    "PyQt6>=6.5",
+    "pyqtgraph>=0.13",
+    "numpy>=1.24",
+    "scapy>=2.5",
+]
+license = {text = "MIT"}
+
+[project.scripts]
+observatory = "observatory.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
