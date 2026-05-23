@@ -74,16 +74,10 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
-        self.start_btn = QPushButton("● Capturar")
-        self.start_btn.setProperty("role", "primary")
-        self.start_btn.clicked.connect(self._start_capture)
-        tb.addWidget(self.start_btn)
-
-        self.stop_btn = QPushButton("⏹ Detener")
-        self.stop_btn.setProperty("role", "danger")
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.clicked.connect(self._stop_capture)
-        tb.addWidget(self.stop_btn)
+        self.toggle_btn = QPushButton("⏸ Pausar")
+        self.toggle_btn.setProperty("role", "danger")
+        self.toggle_btn.clicked.connect(self._on_toggle_clicked)
+        tb.addWidget(self.toggle_btn)
 
         tb.addSeparator()
 
@@ -166,17 +160,24 @@ class MainWindow(QMainWindow):
 
         self.worker = worker
         worker.start()
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
+        self._set_toggle_state(True)
 
     def _stop_capture(self) -> None:
-        if self.worker is None:
+        worker = self.worker
+        if worker is None:
             return
-        self.worker.stop_capture()
-        self.worker.wait(3000)
         self.worker = None
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
+        # Desconectar antes de detener: si scapy emite tardíamente,
+        # nadie recibe (evita reentrar a la GUI ya cerrada).
+        try:
+            worker.error.disconnect()
+            worker.started_capture.disconnect()
+            worker.stopped_capture.disconnect()
+        except (TypeError, RuntimeError):
+            pass
+        worker.stop_capture()
+        worker.wait(5000)
+        self._set_toggle_state(False)
 
     def _on_mode_changed(self) -> None:
         """Cambiar el modo = reiniciar la captura en el nuevo modo."""
@@ -208,8 +209,23 @@ class MainWindow(QMainWindow):
         self.sensor.start()
         self.sensor_panel.reset()
 
+    def _on_toggle_clicked(self) -> None:
+        if self.worker is not None:
+            self._stop_capture()
+        else:
+            self._start_capture()
+
+    def _set_toggle_state(self, capturing: bool) -> None:
+        """Sincroniza el texto y el rol visual del botón con el estado."""
+        self.toggle_btn.setText("⏸ Pausar" if capturing else "⏵ Reanudar")
+        self.toggle_btn.setProperty("role", "danger" if capturing else "primary")
+        s = self.toggle_btn.style()
+        s.unpolish(self.toggle_btn); s.polish(self.toggle_btn)
+
     # ─────────────────────────  tick  ─────────────────────────
     def _on_tick(self) -> None:
+        if self.worker is None:
+            return
         snap = self.estimator.snapshot()
 
         if isinstance(self.sensor, MockSensorBackend):
@@ -231,7 +247,10 @@ class MainWindow(QMainWindow):
         self.thermo_panel.update_from(balance)
 
     # ─────────────────────────  shutdown  ─────────────────────────
-    def closeEvent(self, event) -> None:  # noqa: N802
+    def closeEvent(self, event) -> None: 
+        # Orden importa: parar el timer ANTES de destruir paneles,
+        # luego el worker, luego el sensor, luego super.
+        self.timer.stop()
         self._stop_capture()
         try:
             self.sensor.stop()

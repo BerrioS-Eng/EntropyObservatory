@@ -17,4 +17,11 @@ def run() -> int:
 
     win = MainWindow()
     win.show()
-    return app.exec()
+    code = app.exec()
+
+    # pyqtgraph recomienda esto en Linux para evitar segfaults durante
+    # el shutdown del intérprete (objetos QObject que se destruyen en
+    # orden no determinista). Es una salida explícita: no retorna.
+    import pyqtgraph as pg
+    pg.exit()
+    return code   # inalcanzable; queda por simetría con el tipo declarado
